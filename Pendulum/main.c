@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <math.h>
 #include <SDL3_ttf/SDL_ttf.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define RAD_TO_DEG(X) (X * 180 / pi)
 #define DEG_TO_RAD(X) (X * pi / 180)
@@ -10,6 +12,58 @@
 const float g = 9.81;
 const float pi = 3.14159;
 double lastTick = 0;
+
+//мьютекс для корректного доступа
+//к углу маятника и времени с момента запуска программы
+pthread_mutex_t plot_data_mutex = PTHREAD_MUTEX_INITIALIZER;
+double current_angle;
+double current_time = 0;
+bool running = true;
+
+//функция, рисующая график(будет в другом потоке)
+void *gnuplotThread(void *arg) {
+    FILE *gnuplot = popen("gnuplot -persist", "w");
+    FILE *data_txt = fopen("data.txt", "w");
+
+    fprintf(gnuplot, "set terminal wxt size 400,400\n");
+    fprintf(gnuplot, "set output\n"); 
+    fprintf(gnuplot, "set title 'График угла маятника от времени'\n");
+    fprintf(gnuplot, "set xlabel 'Время (с)'\n");
+    fprintf(gnuplot, "set ylabel 'Угол (рад)'\n");
+    fprintf(gnuplot, "set grid\n");
+    fflush(gnuplot);
+
+    int counter = 0;
+
+    while (running) {
+        //ограничил количество точек на графике до 1000
+        if(counter == 1000) {
+            data_txt = fopen("data.txt", "w");
+            counter = 0;
+        }
+        pthread_mutex_lock(&plot_data_mutex);
+        double time = current_time;
+        double angle = current_angle;
+        pthread_mutex_unlock(&plot_data_mutex);
+
+        fprintf(data_txt, "%lf %lf\n", current_time, current_angle);
+        fflush(data_txt);
+
+        fprintf(gnuplot, "%f %f\n", time, angle);
+        fflush(gnuplot);
+
+        fprintf(gnuplot, "plot 'data.txt' with lines title 'Угол'\n");
+        fflush(gnuplot);
+
+        counter++;
+        usleep(10000);
+    }
+
+    fprintf(gnuplot, "e\n");
+    pclose(gnuplot);
+
+    return NULL;
+}
 
 char *ftocstr(float value) {
     char *BUF = malloc(sizeof(char)*100);
@@ -191,10 +245,8 @@ int main() {
     SDL_Renderer *Renderer = SDL_CreateRenderer(Window, NULL);
     SDL_SetRenderVSync(Renderer, 1);
 
-    bool running = true;
-
-    Pendulum pendulum = {500, 100, 500, 400, (pi/4), 0, 0};
-    pendulum.l = sqrt(pow((pendulum.x1-pendulum.x0), 2) + pow((pendulum.y1-pendulum.y0), 2));
+    Pendulum pendulum = {500, 200, 500, 500, (pi/4), 0, 0};
+    pendulum.l = sqrt((pendulum.x1-pendulum.x0)*(pendulum.x1-pendulum.x0) + (pendulum.y1-pendulum.y0)*(pendulum.y1-pendulum.y0));
     pendulum.cease_coeff = 0;
 
     Ball *ball = createBall(Renderer, "src/blue_ball_DGU.bmp", 40, 40);
@@ -209,6 +261,12 @@ int main() {
         createTextBar(Renderer, Hack_Bold, concat_str("Current integration step: %s", ftocstr(ctrls.delta_time)), 10, 58, 24),
         createTextBar(Renderer, Hack_Bold, concat_str("Current damping: %s", ftocstr(pendulum.cease_coeff)), 10, 82, 24)
     };
+
+    current_angle = RAD_TO_DEG(pendulum.fi);
+
+    //сам поток
+    pthread_t gnuplot_tid;
+    pthread_create(&gnuplot_tid, NULL, gnuplotThread, NULL);
 
     while (running) {
         char *str_ctrls[4] = {
@@ -234,7 +292,16 @@ int main() {
         }
 
         SDL_RenderPresent(Renderer);
+
+        pthread_mutex_lock(&plot_data_mutex);
+        current_time = SDL_GetTicks() / 1000.0;
+        current_angle = RAD_TO_DEG(pendulum.fi);
+        pthread_mutex_unlock(&plot_data_mutex);
     }
+
+    //после выхода программы уничтожаю поток с отрисовкой графика
+    pthread_join(gnuplot_tid, NULL);
+
     TTF_CloseFont(Hack_Bold);
     SDL_DestroyRenderer(Renderer);
     SDL_DestroyWindow(Window);
